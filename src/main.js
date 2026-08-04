@@ -892,7 +892,8 @@ function buildEscPosBytes(order, cfg) {
 
   // Avança papel e corta
   raw(0x0A, 0x0A, 0x0A, 0x0A);
-  raw(0x1D, 0x56, 0x42, 0x03); // GS V — corte parcial
+  raw(0x1D, 0x56, 0x42, 0x03); // GS V B 3 — corte parcial (formato novo, Epson e compatíveis)
+  raw(0x1D, 0x56, 0x01);       // GS V 1 — corte parcial (formato antigo; clones genéricos que não reconhecem o formato novo)
 
   return Buffer.from(buf);
 }
