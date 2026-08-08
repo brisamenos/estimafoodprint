@@ -96,22 +96,26 @@ process.on('uncaughtException', (err) => {
 // de teclado de verdade — não só o foco visual do Electron.
 function forceRealFocus(win) {
   if (!win || win.isDestroyed()) return;
+  if (_forcingFocus) return; // trava de reentrância — evita loop de minimize/restore
   if (process.platform === 'win32') {
+    _forcingFocus = true;
     try {
       win.minimize();
       setTimeout(() => {
-        if (!win || win.isDestroyed()) return;
+        if (!win || win.isDestroyed()) { _forcingFocus = false; return; }
         win.restore();
         win.setAlwaysOnTop(true);
         win.focus();
         win.webContents.focus();
         setTimeout(() => {
+          _forcingFocus = false;
           if (!win || win.isDestroyed()) return;
           win.setAlwaysOnTop(false);
           win.webContents.focus();
         }, 120);
       }, 80);
     } catch (e) {
+      _forcingFocus = false;
       win.show(); win.focus(); win.webContents.focus();
     }
   } else {
@@ -120,6 +124,7 @@ function forceRealFocus(win) {
     win.webContents.focus();
   }
 }
+let _forcingFocus = false;
 
 // ── Janela principal ────────────────────────────────────────
 function createWindow() {
@@ -253,22 +258,12 @@ function createWindow() {
     }, 500);
   });
 
-  // Fix: ao restaurar da bandeja, força foco no webContents pra evitar teclado travado
-  // Usa timeout maior (300ms) pois PCs lentos precisam de mais tempo pra renderizar
-  const refocus = () => {
-    setTimeout(() => {
-      if (!mainWindow || mainWindow.isDestroyed()) return;
-      forceRealFocus(mainWindow);
-      // Segunda tentativa após 500ms adicional — garante PCs muito lentos
-      setTimeout(() => {
-        if (!mainWindow || mainWindow.isDestroyed()) return;
-        mainWindow.webContents.focus();
-      }, 500);
-    }, 300);
-  };
-
-  mainWindow.on('show', refocus);
-  mainWindow.on('restore', refocus);
+  // Fix: garante foco no webContents ao ganhar foco (alt+tab, taskbar, etc)
+  // NOTA: NÃO usa forceRealFocus (minimize/restore) aqui — 'show' e 'restore'
+  // são disparados pelo próprio forceRealFocus quando ele é chamado nos pontos
+  // certos (tray, second-instance, ready-to-show), então reagir a esses
+  // eventos aqui causava um loop infinito de minimizar/restaurar (a tela
+  // ficava piscando sem parar).
   mainWindow.on('focus', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.focus();
