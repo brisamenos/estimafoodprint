@@ -236,8 +236,15 @@ function createWindow() {
       log('🫥 Iniciado com --hidden, ficando na bandeja');
       return;
     }
+    // Aqui NÃO usa forceRealFocus (minimize/restore): esse é o primeiro
+    // show, a página ainda pode estar carregando/pintando a tela, e o
+    // minimize() nesse momento pausa a renderização — causava tela em
+    // branco / carregamento lento. O truque pesado só é necessário quando
+    // a janela é reaberta em segundo plano (bandeja, segunda instância),
+    // com o conteúdo já carregado.
     mainWindow.show();
-    forceRealFocus(mainWindow);
+    mainWindow.focus();
+    mainWindow.webContents.focus();
     if (isDev) mainWindow.webContents.openDevTools();
   });
 
