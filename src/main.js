@@ -84,6 +84,43 @@ process.on('uncaughtException', (err) => {
   try { log('⚠️ uncaughtException:', err && err.message ? err.message : err); } catch {}
 });
 
+// ── Força foco real do Windows (fix teclado travado) ─────────
+// Problema: em muitos notebooks, quando a janela é mostrada por código
+// (auto-start, tray, instância secundária, ready-to-show), o Windows nega
+// silenciosamente o "foreground focus" real por segurança (SetForegroundWindow
+// lock) — a janela aparece na frente e o mouse funciona, mas o teclado não
+// vai pra ela. Só um clique manual do usuário na barra de tarefas resolve,
+// por isso "fechar e abrir de novo" parecia corrigir.
+// Fix: minimizar e restaurar força o Windows a tratar como uma ativação
+// legítima (equivalente a clicar na barra de tarefas), transferindo o foco
+// de teclado de verdade — não só o foco visual do Electron.
+function forceRealFocus(win) {
+  if (!win || win.isDestroyed()) return;
+  if (process.platform === 'win32') {
+    try {
+      win.minimize();
+      setTimeout(() => {
+        if (!win || win.isDestroyed()) return;
+        win.restore();
+        win.setAlwaysOnTop(true);
+        win.focus();
+        win.webContents.focus();
+        setTimeout(() => {
+          if (!win || win.isDestroyed()) return;
+          win.setAlwaysOnTop(false);
+          win.webContents.focus();
+        }, 120);
+      }, 80);
+    } catch (e) {
+      win.show(); win.focus(); win.webContents.focus();
+    }
+  } else {
+    win.show();
+    win.focus();
+    win.webContents.focus();
+  }
+}
+
 // ── Janela principal ────────────────────────────────────────
 function createWindow() {
   const bounds = store.get('windowBounds');
@@ -94,7 +131,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     icon: getIcon(),
-    title: 'EstimaFood',
+    title: 'EstimaFood ' + app.getVersion(),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -105,6 +142,13 @@ function createWindow() {
       backgroundThrottling: false, // Fix: evita que input trave quando janela perde foco
     },
     show: false,
+  });
+
+  // Mantém a versão sempre visível no título, mesmo quando a página web
+  // (gestor.html) tenta trocar o document.title por conta própria.
+  mainWindow.on('page-title-updated', (e, title) => {
+    e.preventDefault();
+    mainWindow.setTitle('EstimaFood ' + app.getVersion());
   });
 
   // Remove menu bar
@@ -188,8 +232,7 @@ function createWindow() {
       return;
     }
     mainWindow.show();
-    mainWindow.focus();
-    mainWindow.webContents.focus();
+    forceRealFocus(mainWindow);
     if (isDev) mainWindow.webContents.openDevTools();
   });
 
@@ -215,8 +258,7 @@ function createWindow() {
   const refocus = () => {
     setTimeout(() => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
-      mainWindow.focus();
-      mainWindow.webContents.focus();
+      forceRealFocus(mainWindow);
       // Segunda tentativa após 500ms adicional — garante PCs muito lentos
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -254,6 +296,29 @@ function createWindow() {
     mainWindow.webContents.insertCSS(`
       .pwa-install-banner, .update-toast { display: none !important; }
     `).catch(() => {});
+
+    // Selo fixo com a versão do app — não depende do gestor.html, some
+    // sozinho se a página recarregar (reinjetado a cada did-finish-load).
+    const v = app.getVersion();
+    mainWindow.webContents.insertCSS(`
+      #ef-version-badge {
+        position: fixed; bottom: 6px; right: 8px; z-index: 999999;
+        font: 11px/1.4 -apple-system, Segoe UI, Arial, sans-serif;
+        color: #9aa0a6; background: rgba(255,255,255,.75);
+        padding: 1px 6px; border-radius: 4px; pointer-events: none;
+        user-select: none;
+      }
+    `).catch(() => {});
+    mainWindow.webContents.executeJavaScript(`
+      (function(){
+        var old = document.getElementById('ef-version-badge');
+        if (old) old.remove();
+        var b = document.createElement('div');
+        b.id = 'ef-version-badge';
+        b.textContent = 'v${v}';
+        document.body.appendChild(b);
+      })();
+    `).catch(() => {});
   });
 }
 
@@ -270,7 +335,7 @@ function createTray() {
     {
       label: '📋 Abrir EstimaFood',
       click: () => {
-        if (mainWindow) { mainWindow.show(); mainWindow.focus(); mainWindow.webContents.focus(); }
+        if (mainWindow) { mainWindow.show(); forceRealFocus(mainWindow); }
         else createWindow();
       }
     },
@@ -317,10 +382,10 @@ function createTray() {
     }
   ]);
 
-  tray.setToolTip('EstimaFood — Impressão Automática');
+  tray.setToolTip('EstimaFood ' + app.getVersion() + ' — Impressão Automática');
   tray.setContextMenu(contextMenu);
   tray.on('double-click', () => {
-    if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+    if (mainWindow) { mainWindow.show(); forceRealFocus(mainWindow); }
   });
 }
 
@@ -1123,7 +1188,7 @@ function setupIPC() {
         {
           label: '📋 Abrir EstimaFood',
           click: () => {
-            if (mainWindow) { mainWindow.show(); mainWindow.focus(); mainWindow.webContents.focus(); }
+            if (mainWindow) { mainWindow.show(); forceRealFocus(mainWindow); }
             else createWindow();
           }
         },
@@ -1135,7 +1200,7 @@ function setupIPC() {
           label: '⚙️ Configurações',
           click: () => {
             if (mainWindow) {
-              mainWindow.show(); mainWindow.focus();
+              mainWindow.show(); forceRealFocus(mainWindow);
               mainWindow.webContents.executeJavaScript("typeof nav==='function'&&nav('impressao')").catch(() => {});
             }
           }
@@ -1541,6 +1606,49 @@ function _checkRegistryAutoStart() {
   });
 }
 
+// ── Método 3: atalho na pasta Startup ────────────────────────
+// A chave Run do registry pode ser apagada por antivírus/"otimizadores" em
+// muitos notebooks, ou o Windows simplesmente ignorar a entrada silenciosamente.
+// O atalho na pasta Startup (shell:startup) é o método mais tradicional e
+// resistente — é o que o próprio Explorer usa e aparece em
+// Configurações > Apps > Inicialização, então o cliente também consegue ver
+// e confirmar visualmente que está ativado.
+function _applyStartupFolderShortcut(enabled, exePath) {
+  return new Promise((resolve) => {
+    const { exec } = require('child_process');
+    const startupDir = path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
+    const lnkPath = path.join(startupDir, 'EstimaFood.lnk');
+    let psScript;
+    if (enabled) {
+      const safeExe = exePath.replace(/'/g, "''");
+      const safeLnk = lnkPath.replace(/'/g, "''");
+      const safeDir = path.dirname(exePath).replace(/'/g, "''");
+      psScript = [
+        `$s = (New-Object -ComObject WScript.Shell).CreateShortcut('${safeLnk}')`,
+        `$s.TargetPath = '${safeExe}'`,
+        `$s.Arguments = '--hidden'`,
+        `$s.WorkingDirectory = '${safeDir}'`,
+        `$s.WindowStyle = 7`,
+        `$s.Save()`,
+      ].join('; ');
+    } else {
+      const safeLnk = lnkPath.replace(/'/g, "''");
+      psScript = `Remove-Item -Path '${safeLnk}' -ErrorAction SilentlyContinue`;
+    }
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+    const cmd = `powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
+    exec(cmd, { timeout: 8000 }, (err) => {
+      if (err) {
+        log('⚠️ Startup folder shortcut erro:', err.message);
+        resolve(false);
+      } else {
+        log('🚀 Startup folder shortcut ' + (enabled ? 'criado' : 'removido'));
+        resolve(true);
+      }
+    });
+  });
+}
+
 async function setupAutoStart() {
   if (process.platform !== 'win32') return;
   try {
@@ -1554,9 +1662,23 @@ async function setupAutoStart() {
       log('⚠️ setLoginItemSettings erro:', e.message);
     }
 
-    // Método 2: Registry direto via PowerShell EncodedCommand (sempre aplica)
-    const ok = await _applyRegistryAutoStart(enabled, exePath);
-    log('🚀 AutoStart:', enabled ? 'habilitado' : 'desabilitado', '| registry:', ok ? 'ok' : 'falhou', '|', exePath);
+    // Método 2: Registry direto via PowerShell EncodedCommand
+    const okReg = await _applyRegistryAutoStart(enabled, exePath);
+
+    // Método 3: atalho na pasta Startup (independente do registry)
+    const okLnk = await _applyStartupFolderShortcut(enabled, exePath);
+
+    // Auto-cura: se o caminho salvo no registry não bate com o exe atual
+    // (ex: após update de versão que mudou de pasta), força regravação.
+    if (enabled) {
+      const current = await _checkRegistryAutoStart();
+      if (!current || !current.includes(exePath)) {
+        log('🔧 Registry autostart desatualizado, regravando...');
+        await _applyRegistryAutoStart(true, exePath);
+      }
+    }
+
+    log('🚀 AutoStart:', enabled ? 'habilitado' : 'desabilitado', '| registry:', okReg ? 'ok' : 'falhou', '| startup-folder:', okLnk ? 'ok' : 'falhou', '|', exePath);
   } catch (e) {
     log('⚠️ AutoStart erro:', e.message);
   }
@@ -1617,10 +1739,8 @@ if (!gotLock) {
 } else {
   app.on('second-instance', () => {
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
       if (!mainWindow.isVisible()) mainWindow.show();
-      mainWindow.focus();
-      mainWindow.webContents.focus();
+      forceRealFocus(mainWindow);
     }
   });
 
@@ -1648,7 +1768,7 @@ if (!gotLock) {
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
-      else if (mainWindow) { mainWindow.show(); mainWindow.focus(); mainWindow.webContents.focus(); }
+      else if (mainWindow) { mainWindow.show(); forceRealFocus(mainWindow); }
     });
 
     log('✅ EstimaFood iniciado | versão:', app.getVersion());
