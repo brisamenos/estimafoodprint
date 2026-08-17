@@ -4,7 +4,7 @@
  * ║  Impressão 100% silenciosa para impressoras térmicas    ║
  * ╚══════════════════════════════════════════════════════════╝
  */
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, Notification, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, Notification, dialog, shell, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -125,6 +125,30 @@ function forceRealFocus(win) {
   }
 }
 let _forcingFocus = false;
+
+// ── Restaura foco de teclado após eventos que podem "roubá-lo" ─
+// Esse é um bug conhecido e antigo do Electron/Chromium NO WINDOWS
+// (electron/electron#20464 e outros): BrowserWindow.isFocused() pode dizer
+// que a janela está em foco, o campo de texto mostra o cursor piscando, mas
+// o teclado real do Windows não está de fato entregue pra ela — só um clique
+// manual do usuário na barra de tarefas "repara" isso de verdade.
+// Qualquer janela nova criada pelo processo principal (mesmo oculta, como as
+// de impressão), qualquer notificação nativa, ou até o próprio Windows sem
+// motivo aparente, pode disparar esse desalinhamento. Por isso NÃO é preciso
+// estar imprimindo pra travar — impressão é só um dos vários gatilhos.
+// Não existe correção 100% garantida do lado do app (é bug do Chromium), mas
+// forçar minimize+restore é o único truque que convence o Windows a tratar
+// como ativação legítima e devolver o foco de teclado de verdade. Chamamos
+// isso depois de toda impressão, toda notificação nativa, e disponibilizamos
+// também via atalho manual (Ctrl+Alt+K) e menu da bandeja pra correção
+// instantânea sem precisar fechar e reabrir o app inteiro.
+function restoreKeyboardFocus() {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!mainWindow.isVisible() || mainWindow.isMinimized()) return; // não mexe se estiver na bandeja
+    forceRealFocus(mainWindow);
+  } catch {}
+}
 
 // ── Janela principal ────────────────────────────────────────
 function createWindow() {
@@ -364,6 +388,12 @@ function createTray() {
       }
     },
     {
+      label: '⌨️ Corrigir teclado travado',
+      click: () => {
+        if (mainWindow) { mainWindow.show(); forceRealFocus(mainWindow); }
+      }
+    },
+    {
       label: '🔄 Recarregar',
       click: () => {
         if (mainWindow) mainWindow.reload();
@@ -493,7 +523,15 @@ async function printSilentElectron(html, opts = {}) {
   const measureWinWidth = Math.round(widthMm / 25.4 * 96);
   const measureWin = new BrowserWindow({
     show: false, width: measureWinWidth, height: 4000,
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    // offscreen:true — a correção mais forte contra o teclado travado: essa
+    // opção faz o Electron NUNCA criar uma janela real do Windows (nenhum
+    // HWND) pra esse conteúdo — ele é renderizado só como bitmap em memória.
+    // Sem janela nativa, é estruturalmente impossível ela entrar na disputa
+    // de foco do Windows com a janela principal. focusable/skipTaskbar
+    // ficam como reforço, mas offscreen é o que resolve de verdade.
+    focusable: false,
+    skipTaskbar: true,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, offscreen: true },
   });
 
   let contentHeight;
@@ -532,7 +570,10 @@ async function printSilentElectron(html, opts = {}) {
 
   const printWin = new BrowserWindow({
     show: false, width: measureWinWidth, height: 2000,
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    // Mesmo motivo do measureWin acima — ver comentário lá.
+    focusable: false,
+    skipTaskbar: true,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, offscreen: true },
   });
 
   try {
@@ -596,12 +637,14 @@ async function printSilentElectron(html, opts = {}) {
 
     try { fs.unlinkSync(printFile); } catch {}
     setTimeout(() => { try { fs.unlinkSync(pdfFile); } catch {} }, 5000);
+    restoreKeyboardFocus();
     return { ok: true };
 
   } catch (e) {
     try { printWin.close(); } catch {}
     try { fs.unlinkSync(printFile); } catch {}
     log('❌ Impressão falhou:', e.message);
+    restoreKeyboardFocus();
     throw e;
   }
 }
@@ -1207,6 +1250,10 @@ function setupIPC() {
             }
           }
         },
+        {
+          label: '⌨️ Corrigir teclado travado',
+          click: () => { if (mainWindow) { mainWindow.show(); forceRealFocus(mainWindow); } }
+        },
         { label: '🔄 Recarregar', click: () => { if (mainWindow) mainWindow.reload(); } },
         { label: '🔧 DevTools', visible: isDev, click: () => { if (mainWindow) mainWindow.webContents.toggleDevTools(); } },
         { type: 'separator' },
@@ -1293,6 +1340,15 @@ function setupIPC() {
         silent: false,
       });
       notif.show();
+      // A criação de QUALQUER notificação nativa do Windows pode fazer o SO
+      // "roubar" o foco real de teclado da janela principal em segundo plano
+      // (mesmo ela continuando visível/na frente) — é o mesmo bug de fundo
+      // dos comentários no topo do arquivo (forceRealFocus), só que disparado
+      // aqui em vez de minimize/tray. Como isso roda a CADA pedido novo (via
+      // SSE), é provavelmente o gatilho mais frequente do teclado travar —
+      // mais frequente até que a própria impressão. Restaura o foco logo em
+      // seguida, sem o usuário perceber.
+      restoreKeyboardFocus();
     }
     return { ok: true };
   });
@@ -1518,6 +1574,7 @@ function setupUpdater() {
           body: `Baixando versão ${info.version}...`,
           icon: getIcon(),
         }).show();
+        restoreKeyboardFocus();
       }
     });
 
@@ -1537,6 +1594,7 @@ function setupUpdater() {
           body: `Versão ${info.version} pronta! Reiniciando em 10 segundos...`,
           icon: getIcon(),
         }).show();
+        restoreKeyboardFocus();
       }
       // Instala automaticamente após 10 segundos
       setTimeout(() => {
@@ -1575,7 +1633,7 @@ function _applyRegistryAutoStart(enabled, exePath) {
     let psScript;
     if (enabled) {
       const safePath = exePath.replace(/'/g, "''");
-      psScript = `Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '${REG_NAME}' -Value '"${safePath}" --hidden' -Type String -Force`;
+      psScript = `Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '${REG_NAME}' -Value '"${safePath}"' -Type String -Force`;
     } else {
       psScript = [
         `Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '${REG_NAME}' -ErrorAction SilentlyContinue`,
@@ -1628,9 +1686,8 @@ function _applyStartupFolderShortcut(enabled, exePath) {
       psScript = [
         `$s = (New-Object -ComObject WScript.Shell).CreateShortcut('${safeLnk}')`,
         `$s.TargetPath = '${safeExe}'`,
-        `$s.Arguments = '--hidden'`,
         `$s.WorkingDirectory = '${safeDir}'`,
-        `$s.WindowStyle = 7`,
+        `$s.WindowStyle = 1`,
         `$s.Save()`,
       ].join('; ');
     } else {
@@ -1658,8 +1715,11 @@ async function setupAutoStart() {
     const exePath = app.getPath('exe');
 
     // Método 1: Electron API (tenta, mas pode falhar silenciosamente)
+    // openAsHidden:false + sem args --hidden — o app deve abrir a janela
+    // normalmente ao iniciar com o Windows, igual outros programas (Anotaí
+    // etc.), não ficar escondido só na bandeja esperando o usuário clicar.
     try {
-      app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true, path: exePath, args: ['--hidden'] });
+      app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: false, path: exePath });
     } catch (e) {
       log('⚠️ setLoginItemSettings erro:', e.message);
     }
@@ -1768,6 +1828,19 @@ if (!gotLock) {
       }
     });
 
+    // Atalho de emergência: corrige o teclado travado na hora, sem precisar
+    // fechar e reabrir o app (que reseta um pedido em digitação). Funciona
+    // mesmo se o teclado estiver "travado" porque não depende de digitação —
+    // é um atalho GLOBAL do sistema operacional.
+    try {
+      globalShortcut.register('Control+Alt+K', () => {
+        log('⌨️ Atalho de correção de teclado acionado (Ctrl+Alt+K)');
+        restoreKeyboardFocus();
+      });
+    } catch (e) {
+      log('⚠️ Não foi possível registrar atalho de teclado:', e.message);
+    }
+
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
       else if (mainWindow) { mainWindow.show(); forceRealFocus(mainWindow); }
@@ -1777,6 +1850,10 @@ if (!gotLock) {
   });
 
   app.on('before-quit', () => { isQuitting = true; });
+
+  app.on('will-quit', () => {
+    try { globalShortcut.unregisterAll(); } catch {}
+  });
 
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin' && !store.get('minimizeToTray')) {
