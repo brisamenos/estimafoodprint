@@ -1,6 +1,6 @@
 {
   "name": "estimafood-print",
-  "version": "1.10.28",
+  "version": "1.10.30",
   "description": "EstimaFood — Impressão Automática para Restaurantes",
   "main": "src/main.js",
   "author": "EstimaFood",
