@@ -1331,6 +1331,26 @@ function setupIPC() {
     }
   });
 
+  // Watchdog anti-teclado-travado (ver comentário completo no preload.js).
+  // Disparado toda vez que o usuário clica/foca um campo de texto na
+  // página. Reforça o foco de teclado de forma leve e instantânea — o
+  // toggle setEnabled(false)->true é praticamente imperceptível (sem
+  // minimizar/piscar a janela), diferente do forceRealFocus "pesado" usado
+  // depois de impressão/notificação/tray.
+  let _lastInputFocusFix = 0;
+  ipcMain.on('input:activity', () => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
+      const now = Date.now();
+      if (now - _lastInputFocusFix < 400) return;
+      _lastInputFocusFix = now;
+      mainWindow.webContents.focus();
+      mainWindow.setEnabled(false);
+      mainWindow.setEnabled(true);
+    } catch {}
+  });
+
   // Notificação nativa
   ipcMain.handle('app:notify', async (_e, title, body) => {
     if (Notification.isSupported()) {

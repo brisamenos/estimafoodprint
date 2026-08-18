@@ -93,3 +93,32 @@ contextBridge.exposeInMainWorld('ElectronPrint', {
   /** Liga/desliga inicialização junto com Windows. @param {boolean} enabled */
   setAutoStart: (enabled) => ipcRenderer.invoke('app:setAutoStart', !!enabled),
 });
+
+/**
+ * ── Watchdog anti-teclado-travado ───────────────────────────────
+ * Sempre que o usuário clica/foca um campo de texto (input, textarea,
+ * contenteditable) OU digita alguma tecla, avisa o processo principal.
+ * Isso NÃO exige nenhuma mudança no site (gestor.html) — roda aqui no
+ * preload, que enxerga o DOM da página real mesmo sendo carregada do
+ * servidor remoto. O processo principal usa esses avisos pra reforçar o
+ * foco de teclado exatamente no momento em que o usuário está prestes a
+ * digitar, de forma instantânea e sem nenhum efeito visual (sem
+ * minimizar/restaurar) — pega o problema ANTES dele acontecer, em vez de
+ * só corrigir depois que já travou.
+ */
+(function () {
+  let lastPing = 0;
+  function ping() {
+    const now = Date.now();
+    if (now - lastPing < 500) return; // evita spam a cada tecla
+    lastPing = now;
+    try { ipcRenderer.send('input:activity'); } catch {}
+  }
+  function isTextField(el) {
+    if (!el) return false;
+    const tag = (el.tagName || '').toUpperCase();
+    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable === true;
+  }
+  document.addEventListener('focusin', (e) => { if (isTextField(e.target)) ping(); }, true);
+  document.addEventListener('mousedown', (e) => { if (isTextField(e.target)) ping(); }, true);
+})();
