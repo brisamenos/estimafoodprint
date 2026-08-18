@@ -320,6 +320,34 @@ function createWindow() {
 
   // Inject CSS para esconder elementos web desnecessários no desktop
   mainWindow.webContents.on('did-finish-load', () => {
+    // ── Fix teclado travado — causa raiz mais provável ────────────────
+    // Bug documentado do Electron no Windows (electron/electron#20821):
+    // toda vez que a página chama window.confirm()/alert()/prompt() —
+    // as caixinhas nativas "Tem certeza?" — o Windows pode NÃO devolver
+    // o foco de teclado real pra janela quando o diálogo fecha, mesmo
+    // ela continuando visível/clicável. O Anotaí usa confirm() em
+    // dezenas de telas diferentes (cancelar pedido, excluir item,
+    // excluir mesa, etc.) — provavelmente o gatilho mais frequente de
+    // todos, e explica por que trava em "várias ferramentas".
+    // Não precisamos mudar nada no código do Anotaí: interceptamos
+    // window.alert/confirm/prompt aqui, no "mundo principal" da página
+    // (executeJavaScript roda lá, diferente do preload que fica isolado),
+    // e avisamos o processo principal assim que o diálogo fecha.
+    mainWindow.webContents.executeJavaScript(`
+      (function(){
+        if (window.__efDialogPatchApplied) return;
+        window.__efDialogPatchApplied = true;
+        ['alert','confirm','prompt'].forEach(function(fn){
+          var original = window[fn].bind(window);
+          window[fn] = function(){
+            var r = original.apply(window, arguments);
+            try { window.ElectronPrint && window.ElectronPrint._dialogClosed && window.ElectronPrint._dialogClosed(); } catch(e){}
+            return r;
+          };
+        });
+      })();
+    `).catch(() => {});
+
     mainWindow.webContents.insertCSS(`
       .pwa-install-banner, .update-toast { display: none !important; }
     `).catch(() => {});
@@ -1333,21 +1361,37 @@ function setupIPC() {
 
   // Watchdog anti-teclado-travado (ver comentário completo no preload.js).
   // Disparado toda vez que o usuário clica/foca um campo de texto na
-  // página. Reforça o foco de teclado de forma leve e instantânea — o
-  // toggle setEnabled(false)->true é praticamente imperceptível (sem
-  // minimizar/piscar a janela), diferente do forceRealFocus "pesado" usado
-  // depois de impressão/notificação/tray.
+  // página. Usa a MESMA técnica comprovada (forceRealFocus: minimize +
+  // restore) que já resolve o problema em outros pontos do app — um
+  // toggle "leve" sem minimize/restore foi testado e NÃO se mostrou
+  // confiável pra restaurar o foco de teclado real do Windows, por isso
+  // trocamos pra técnica que realmente funciona. Causa um piscar rápido
+  // (blink) na janela, mas só quando necessário (throttle de 2s) — melhor
+  // um piscar rápido do que não conseguir digitar.
   let _lastInputFocusFix = 0;
   ipcMain.on('input:activity', () => {
     try {
       if (!mainWindow || mainWindow.isDestroyed()) return;
       if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
       const now = Date.now();
-      if (now - _lastInputFocusFix < 400) return;
+      if (now - _lastInputFocusFix < 2000) return;
       _lastInputFocusFix = now;
-      mainWindow.webContents.focus();
-      mainWindow.setEnabled(false);
-      mainWindow.setEnabled(true);
+      forceRealFocus(mainWindow);
+    } catch {}
+  });
+
+  // Fechamento de confirm()/alert()/prompt() nativo (injetado via
+  // did-finish-load — ver comentário lá). É o gatilho mais bem documentado
+  // do bug de teclado travado no Electron/Windows (usado em ~50 lugares
+  // diferentes no Anotaí: cancelar pedido, excluir item, excluir mesa,
+  // etc.) — provavelmente a causa mais frequente de todas. Sem throttle
+  // aqui: cada diálogo fechado é um evento raro e intencional do usuário,
+  // sempre vale reforçar o foco.
+  ipcMain.on('dialog:closed', () => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
+      forceRealFocus(mainWindow);
     } catch {}
   });
 
@@ -1903,6 +1947,27 @@ if (!gotLock) {
         }, 150);
       }
     });
+
+    // ── Watchdog CONTÍNUO anti-teclado-travado ──────────────────────
+    // As correções anteriores só agiam em RESPOSTA a um evento (clique,
+    // impressão, notificação). Mas o travamento também acontece no MEIO do
+    // uso, sem nenhum evento novo disparando nada — por isso continuava
+    // acontecendo mesmo com as correções anteriores. Esse watchdog roda
+    // sozinho a cada poucos segundos, o tempo todo, reforçando o foco de
+    // teclado continuamente enquanto o app estiver aberto e visível — sem
+    // depender de clique, impressão ou qualquer gatilho específico. O
+    // toggle setEnabled(false→true) é instantâneo e invisível (sem piscar
+    // a janela), então rodar isso o tempo todo não atrapalha o uso normal.
+    setInterval(() => {
+      try {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
+        if (!mainWindow.isFocused()) return; // só mexe se a janela estiver mesmo em uso
+        mainWindow.webContents.focus();
+        mainWindow.setEnabled(false);
+        mainWindow.setEnabled(true);
+      } catch {}
+    }, 3000);
 
     // Atalho de emergência: corrige o teclado travado na hora, sem precisar
     // fechar e reabrir o app (que reseta um pedido em digitação). Funciona

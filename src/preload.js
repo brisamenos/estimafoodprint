@@ -92,6 +92,12 @@ contextBridge.exposeInMainWorld('ElectronPrint', {
   getAutoStart: () => ipcRenderer.invoke('app:getAutoStart'),
   /** Liga/desliga inicialização junto com Windows. @param {boolean} enabled */
   setAutoStart: (enabled) => ipcRenderer.invoke('app:setAutoStart', !!enabled),
+
+  /** Uso interno — avisa o processo principal que um diálogo nativo
+   *  (confirm/alert/prompt) acabou de fechar, pra reforçar o foco de
+   *  teclado (ver comentário completo no main.js / did-finish-load). */
+  _focusPing: () => ipcRenderer.send('input:activity'),
+  _dialogClosed: () => ipcRenderer.send('dialog:closed'),
 });
 
 /**
