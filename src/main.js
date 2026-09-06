@@ -640,8 +640,14 @@ async function printSilentElectron(html, opts = {}) {
       try {
         const ptpPath = require.resolve('pdf-to-printer');
         const ptpDir = path.dirname(ptpPath);
-        for (const p of [path.join(ptpDir,'SumatraPDF.exe'),path.join(ptpDir,'..','SumatraPDF.exe'),path.join(ptpDir,'SumatraPDF-3.4.6-64.exe'),path.join(ptpDir,'..','SumatraPDF-3.4.6-64.exe')]) {
-          if (fs.existsSync(p)) { sumatraPath = p; break; }
+        // O pdf-to-printer empacota um único binário (ex.: SumatraPDF-3.4.6-32.exe,
+        // que é 32-bit mesmo em builds x64 do app) — buscamos pelo prefixo em vez de
+        // um nome/versão fixos, para funcionar em qualquer arquitetura (x64 ou ia32).
+        for (const dir of [ptpDir, path.join(ptpDir, '..')]) {
+          try {
+            const found = fs.readdirSync(dir).find(f => /^SumatraPDF.*\.exe$/i.test(f));
+            if (found) { sumatraPath = path.join(dir, found); break; }
+          } catch {}
         }
       } catch {}
       if (!sumatraPath) {
