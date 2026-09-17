@@ -460,6 +460,30 @@ async function printSilentElectron(html, opts = {}) {
   const printer = opts.printer || store.get('printer') || '';
   const paperWidth = opts.paperWidth || store.get('paperWidth') || 80;
 
+  // CRÍTICO: se foi pedida uma impressora específica, confirma que ela existe
+  // NESTE computador antes de tentar imprimir. Sem essa checagem, pedir pra
+  // imprimir numa impressora que só existe em outro computador (ex: loja com
+  // 2 PCs) podia: (a) o pdf-to-printer silenciosamente cair na impressora
+  // padrão do Windows em vez de falhar, ou (b) o fallback via
+  // SumatraPDF/PowerShell "funcionar" sem checar erro nenhum — nos dois
+  // casos o job era dado como impresso com sucesso mesmo saindo no lugar
+  // errado (ou em nenhum lugar). Falhando aqui explicitamente, quem chamou
+  // (o gestor no navegador) sabe que falhou e manda o job pra fila
+  // compartilhada, que é o que faz ele chegar no computador certo.
+  if (printer) {
+    try {
+      const localPrinters = await getSysPrinters();
+      const localNames = (Array.isArray(localPrinters) ? localPrinters : []).map(p => p.name).filter(Boolean);
+      if (localNames.length && !localNames.includes(printer)) {
+        throw new Error(`Impressora "${printer}" nao encontrada neste computador`);
+      }
+    } catch (checkErr) {
+      if (String(checkErr.message || '').includes('nao encontrada')) throw checkErr;
+      // Falha ao LISTAR impressoras (cenário diferente de "não encontrada")
+      // — não trava a impressão por causa disso, segue tentando.
+    }
+  }
+
   // ESTRATÉGIA UNIVERSAL: gera o PDF com a largura de ÁREA IMPRIMÍVEL MÍNIMA que
   // funciona em QUALQUER impressora térmica do mercado. Combinado com scale='fit',
   // o driver da impressora expande o PDF até o limite da área imprimível DELA —
@@ -1505,6 +1529,7 @@ let _pqTimer = null;
 let _pqHbTimer = null;
 let _pqActive = false;
 let _pqJobCount = 0;
+let _pqLocalPrinters = []; // cache das impressoras que ESTE computador enxerga localmente
 
 function _pqRequest(method, baseUrl, urlPath, tenantId, body) {
   return new Promise((resolve, reject) => {
@@ -1562,14 +1587,20 @@ function startPrintQueuePolling() {
   let _pqFailCount = 0; // backoff exponencial em caso de erro
   log('[PQ] ✅ Polling iniciado |', baseUrl);
 
-  // Heartbeat a cada 30s (antes era 15s — desnecessariamente agressivo)
-  const hb = () => {
+  // Heartbeat a cada 30s (antes era 15s — desnecessariamente agressivo).
+  // Aproveita esse ciclo pra também atualizar a lista de impressoras locais
+  // (raramente muda, então não precisa buscar a cada poll).
+  const hb = async () => {
     if (!_pqActive) return;
+    try {
+      const printers = await getSysPrinters();
+      _pqLocalPrinters = (Array.isArray(printers) ? printers : []).map(p => p.name).filter(Boolean);
+    } catch (e) { log('[PQ] Falha ao listar impressoras locais:', e.message); }
     const tid = _pqGetTenantId();
     if (!tid) return;
-    _pqRequest('POST', baseUrl, '/api/print-queue/heartbeat', tid, { printer: 'EstimaFoodPrint' }).catch(() => {});
+    _pqRequest('POST', baseUrl, '/api/print-queue/heartbeat', tid, { printer: _pqLocalPrinters.join(',') || 'EstimaFoodPrint' }).catch(() => {});
   };
-  hb();
+  const _hbPromise = hb();
   _pqHbTimer = setInterval(hb, 30000);
 
   // Polling com backoff. Sem tenant: aguarda 10s e tenta de novo (não chega no servidor).
@@ -1585,7 +1616,15 @@ function startPrintQueuePolling() {
     }
 
     try {
-      const res = await _pqRequest('GET', baseUrl, '/api/print-queue/pending', tid);
+      // CRÍTICO: manda a lista de impressoras que ESTE computador enxerga
+      // localmente. Sem isso, o servidor devolvia TODOS os jobs pendentes
+      // do tenant pra qualquer computador que perguntasse primeiro — em loja
+      // com mais de um computador/impressora, isso fazia pedidos saírem no
+      // computador/impressora errada (ou os dois brigando pelo mesmo job).
+      const printersQS = _pqLocalPrinters.length
+        ? '?printers=' + encodeURIComponent(_pqLocalPrinters.join(','))
+        : '';
+      const res = await _pqRequest('GET', baseUrl, '/api/print-queue/pending' + printersQS, tid);
       _pqFailCount = 0; // resetou erro
       if (Array.isArray(res.body) && res.body.length) {
         log(`[PQ] 📋 ${res.body.length} job(s) pendente(s)`);
@@ -1611,7 +1650,7 @@ function startPrintQueuePolling() {
     const nextDelay = _pqFailCount === 0 ? 4000 : Math.min(4000 * Math.pow(2, _pqFailCount), 60000);
     _pqTimer = setTimeout(poll, nextDelay);
   };
-  poll();
+  _hbPromise.then(poll).catch(() => poll());
 }
 
 function stopPrintQueuePolling() {
