@@ -458,7 +458,11 @@ function getSysPrinters() {
 
 async function printSilentElectron(html, opts = {}) {
   const printer = opts.printer || store.get('printer') || '';
-  const paperWidth = opts.paperWidth || store.get('paperWidth') || 80;
+  // Versões antigas do painel mandavam a ÁREA ÚTIL (48 ou 72) no lugar da
+  // largura do papel (58 ou 80). Como 48 não é 58, a bobina de 58 mm era
+  // tratada como 80 mm: página de 70 mm numa impressora que só imprime 48 mm.
+  const paperWidthRaw = opts.paperWidth || store.get('paperWidth') || 80;
+  const paperWidth = paperWidthRaw === 48 ? 58 : (paperWidthRaw === 72 ? 80 : paperWidthRaw);
 
   // CRÍTICO: se foi pedida uma impressora específica, confirma que ela existe
   // NESTE computador antes de tentar imprimir. Sem essa checagem, pedir pra
@@ -539,10 +543,11 @@ async function printSilentElectron(html, opts = {}) {
       box-sizing: border-box;
       width: WIDTHmm;
       margin: 0 !important;
-      /* Padding esquerdo de 4mm compensa drivers que alinham à esquerda
+      /* 80mm: padding esquerdo de 4mm compensa drivers que alinham à esquerda
          com margem morta (Epson TM-T20X tem ~4mm de margem interna).
-         Em impressoras que centralizam (Elgin), é apenas folga extra. */
-      padding: 0 0 0 4mm !important;
+         58mm: 2mm de cada lado. Os 4mm só na esquerda empurravam o cupom
+         para a direita e ele saía descentralizado na bobina estreita. */
+      padding: PADDING !important;
       color: #000 !important;
       overflow: hidden !important;
     }
@@ -563,7 +568,8 @@ async function printSilentElectron(html, opts = {}) {
     .replace(/WIDTH/g, String(widthMm))
     .replace(/HEIGHT/g, String(h))
     .replace(/FONTPX/g, String(baseFontPx))
-    .replace(/LARGEPX/g, String(largeFontPx));
+    .replace(/LARGEPX/g, String(largeFontPx))
+    .replace(/PADDING/g, paperWidth === 58 ? '0 2mm' : '0 0 0 4mm');
 
   // PASSO 1: Mede a altura real do conteúdo
   const measureCss = applyVars(resetCSS, '2000');
