@@ -4,7 +4,7 @@
  * ║  Impressão 100% silenciosa para impressoras térmicas    ║
  * ╚══════════════════════════════════════════════════════════╝
  */
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, Notification, dialog, shell, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, Notification, dialog, shell, globalShortcut, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -201,7 +201,7 @@ function createWindow() {
     // bloqueava teclado em PCs lentos. Aqui só rodamos código se a URL
     // contém login.html, e marcamos _sessionApplied=true imediatamente.
     const savedSession = store.get('_savedSession');
-    let _sessionApplied = false;
+    _sessionApplied = false;
     if (savedSession) {
       const age = Date.now() - (savedSession.ts || 0);
       if (age >= 30 * 24 * 60 * 60 * 1000) {
@@ -227,35 +227,66 @@ function createWindow() {
       }
     }
 
-    // Tenta carregar com retry antes de mostrar tela offline
-    const tryLoad = (attempt = 1, maxAttempts = 5, delay = 3000) => {
-      log(`🌐 Tentativa ${attempt}/${maxAttempts}: ${serverUrl}`);
-      mainWindow.loadURL(serverUrl).catch(err => {
-        log(`❌ Tentativa ${attempt} falhou:`, err.message);
-        if (!mainWindow || mainWindow.isDestroyed()) return;
-        if (attempt < maxAttempts) {
-          log(`⏳ Aguardando ${delay / 1000}s antes da próxima tentativa...`);
-          setTimeout(() => tryLoad(attempt + 1, maxAttempts, Math.min(delay * 1.5, 15000)), delay);
-        } else {
-          log('❌ Todas as tentativas falharam. Mostrando tela offline.');
-          mainWindow.loadFile(path.join(__dirname, 'offline.html'));
-        }
-      });
-    };
-
-    // Também trata did-fail-load (erros de página que não rejeitam a Promise)
-    mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
-      if (!url || url.startsWith('file://') || url === 'about:blank') return;
-      log(`⚠️ did-fail-load: ${code} ${desc} — ${url}`);
-    });
-
-    tryLoad();
+    // Tenta carregar com retry (e tempo limite) antes de mostrar tela offline
+    abrirServidor('inicio');
   } else {
     mainWindow.loadFile(path.join(__dirname, 'setup.html'));
   }
 
+  // ── Proteção contra TELA BRANCA ──────────────────────────────────
+  // Quando o carregamento falha (internet ainda não conectou ao ligar o PC,
+  // servidor demorou, queda de rede) o Chromium mostra uma página de erro
+  // vazia — a tela branca. Como fechar a janela só esconde na bandeja,
+  // reabrir mostrava a MESMA página vazia, e só matar o processo resolvia.
+  // Agora qualquer falha de carregamento da página principal leva pra tela
+  // offline (que tenta de novo sozinha a cada 15s).
+  const winAtual = mainWindow;
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return; // -3 = navegação interrompida por outra (normal)
+    if (!url || url.startsWith('file://') || url === 'about:blank') return;
+    log(`⚠️ did-fail-load: ${code} ${desc} — ${url}`);
+    if (_cargaGerenciada) return; // abrirServidor já está cuidando das tentativas
+    setTimeout(() => mostrarOffline('falha ao carregar: ' + desc), 300);
+  });
+  // Página do gestor travou ou fechou sozinha (falta de memória, erro interno):
+  // antes ficava branca pra sempre. Agora recarrega sozinha.
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    log('💥 Página parou:', details && details.reason);
+    if (details && details.reason === 'clean-exit') return;
+    setTimeout(() => {
+      if (mainWindow === winAtual && !winAtual.isDestroyed()) abrirServidor('página parou');
+    }, 1000);
+  });
+  let _travadaTimer = null;
+  mainWindow.webContents.on('unresponsive', () => {
+    log('⏳ Página sem responder...');
+    if (_travadaTimer) return;
+    _travadaTimer = setTimeout(() => {
+      _travadaTimer = null;
+      if (mainWindow !== winAtual || winAtual.isDestroyed()) return;
+      log('💥 Página travada há 20s — recarregando');
+      try { winAtual.webContents.forcefullyCrashRenderer(); } catch {}
+      setTimeout(() => abrirServidor('página travada'), 500);
+    }, 20000);
+  });
+  mainWindow.webContents.on('responsive', () => {
+    if (_travadaTimer) { clearTimeout(_travadaTimer); _travadaTimer = null; }
+  });
+  // Toda vez que a janela aparece (clique no ícone, bandeja, segunda
+  // instância): força redesenhar e confere se a tela não está em branco.
+  mainWindow.on('show', () => {
+    try { winAtual.webContents.invalidate(); } catch {}
+    setTimeout(() => verificarTelaBranca('janela aberta'), 2500);
+  });
+
   // Show when ready (mas respeita --hidden quando iniciado com Windows)
   const startedHidden = process.argv.includes('--hidden');
+  // Segurança: se o primeiro desenho nunca acontecer (carregamento preso),
+  // mostra a janela mesmo assim depois de 12s — antes ela podia nem aparecer.
+  setTimeout(() => {
+    if (startedHidden || mainWindow !== winAtual || winAtual.isDestroyed()) return;
+    if (!winAtual.isVisible()) { log('🪟 Mostrando janela (ready-to-show não veio)'); winAtual.show(); }
+  }, 12000);
   mainWindow.once('ready-to-show', () => {
     if (startedHidden) {
       log('🫥 Iniciado com --hidden, ficando na bandeja');
@@ -310,7 +341,7 @@ function createWindow() {
     }
   });
 
-  mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.on('closed', () => { if (mainWindow === winAtual) mainWindow = null; });
 
   // Links externos abrem no navegador
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -377,6 +408,130 @@ function createWindow() {
   });
 }
 
+// ── Carregamento do gestor com tentativas e tempo limite ─────
+// Substitui o antigo tryLoad local. Diferenças:
+//  • tempo limite de 45s por tentativa (antes uma conexão "pendurada"
+//    deixava a tela branca sem nunca falhar nem tentar de novo);
+//  • pode ser chamada de qualquer lugar (recuperação de tela branca,
+//    página travada) sem abrir duas sequências de tentativas ao mesmo tempo.
+let _sessionApplied = false;
+let _cargaGerenciada = false;
+let _cargaGeracao = 0;
+function abrirServidor(motivo) {
+  const serverUrl = store.get('serverUrl');
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!serverUrl) { mainWindow.loadFile(path.join(__dirname, 'setup.html')); return; }
+  const geracao = ++_cargaGeracao;
+  _cargaGerenciada = true;
+  _sessionApplied = false; // permite restaurar o login salvo de novo nesta carga
+  if (motivo && motivo !== 'inicio') log(`🔄 Recarregando o gestor (${motivo})`);
+  const win = mainWindow;
+  const tentar = (attempt = 1, maxAttempts = 5, delay = 3000) => {
+    if (geracao !== _cargaGeracao || win.isDestroyed()) return;
+    log(`🌐 Tentativa ${attempt}/${maxAttempts}: ${serverUrl}`);
+    let terminou = false;
+    const limite = setTimeout(() => {
+      if (terminou || geracao !== _cargaGeracao || win.isDestroyed()) return;
+      log(`⌛ Tentativa ${attempt} passou de 45s — cancelando`);
+      try { win.webContents.stop(); } catch {}
+    }, 45000);
+    win.loadURL(serverUrl).then(() => {
+      terminou = true; clearTimeout(limite);
+      if (geracao === _cargaGeracao) _cargaGerenciada = false;
+    }).catch(err => {
+      terminou = true; clearTimeout(limite);
+      if (geracao !== _cargaGeracao || win.isDestroyed()) return;
+      // -3 (ERR_ABORTED) com a página já em outro endereço do gestor = o
+      // próprio gestor redirecionou (ex: pro login). Não é falha.
+      const atual = win.webContents.getURL() || '';
+      const outraNavegacao = win.webContents.isLoading() || (atual && atual !== serverUrl && !atual.startsWith('chrome-error') && atual.startsWith('http'));
+      if (/ERR_ABORTED/.test(err.message || '') && outraNavegacao) {
+        _cargaGerenciada = false;
+        return;
+      }
+      log(`❌ Tentativa ${attempt} falhou:`, err.message);
+      if (attempt < maxAttempts) {
+        // Mostra logo a tela "sem conexão" em vez da página de erro em
+        // branco, e só tenta abrir o gestor de novo quando o servidor
+        // responder (testa em segundo plano, sem trocar a tela).
+        mostrarOffline('tentando de novo');
+        log(`⏳ Aguardando ${delay / 1000}s antes da próxima tentativa...`);
+        const proxima = (n, d) => setTimeout(async () => {
+          if (geracao !== _cargaGeracao || win.isDestroyed()) return;
+          if (await servidorResponde(serverUrl, 8000)) { tentar(n, maxAttempts, Math.min(d * 1.5, 15000)); return; }
+          log(`📡 Servidor ainda não responde (${n}/${maxAttempts})`);
+          if (n < maxAttempts) proxima(n + 1, Math.min(d * 1.5, 15000));
+          else { _cargaGerenciada = false; log('❌ Sem resposta. Tela offline segue tentando a cada 15s.'); }
+        }, d);
+        proxima(attempt + 1, delay);
+      } else {
+        log('❌ Todas as tentativas falharam. Mostrando tela offline.');
+        _cargaGerenciada = false;
+        mostrarOffline('sem conexão');
+      }
+    });
+  };
+  tentar();
+}
+
+// Testa se o servidor responde, sem mexer na tela (HEAD rápido).
+function servidorResponde(url, ms) {
+  return new Promise(resolve => {
+    let pronto = false;
+    const fim = v => { if (!pronto) { pronto = true; resolve(v); } };
+    try {
+      const req = net.request({ method: 'HEAD', url });
+      req.on('response', () => { fim(true); try { req.abort(); } catch {} });
+      req.on('error', () => fim(false));
+      setTimeout(() => { fim(false); try { req.abort(); } catch {} }, ms);
+      req.end();
+    } catch { fim(false); }
+  });
+}
+
+function mostrarOffline(motivo) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const atual = mainWindow.webContents.getURL() || '';
+  if (atual.endsWith('offline.html')) return; // já está nela (ela tenta sozinha)
+  log('📴 Tela offline:', motivo || '');
+  mainWindow.loadFile(path.join(__dirname, 'offline.html')).catch(() => {});
+}
+
+// Confere se a página está viva e com conteúdo. Se estiver em branco,
+// travada ou fechada, recarrega o gestor sozinho — o mesmo efeito de
+// finalizar a tarefa, sem precisar abrir o gerenciador de tarefas.
+let _ultimaRecuperacao = 0;
+async function verificarTelaBranca(origem) {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
+    if (_cargaGerenciada) return; // ainda tentando carregar
+    const wc = mainWindow.webContents;
+    let problema = null;
+    if (wc.isCrashed()) problema = 'página fechada';
+    else if (!wc.isLoading()) {
+      const url = wc.getURL() || '';
+      if (!url || url === 'about:blank' || url.startsWith('chrome-error')) problema = 'página vazia';
+      else {
+        const r = await Promise.race([
+          wc.executeJavaScript(
+            '(function(){var b=document.body;return {t:b?(b.innerText||"").trim().length:0}})()', true
+          ).catch(() => null),
+          new Promise(res => setTimeout(() => res('travada'), 6000)),
+        ]);
+        if (r === 'travada') problema = 'página travada';
+        else if (r && r.t < 15) problema = 'tela em branco';
+      }
+    }
+    if (!problema) return;
+    if (Date.now() - _ultimaRecuperacao < 15000) return; // evita ficar recarregando sem parar
+    _ultimaRecuperacao = Date.now();
+    log(`🩹 ${problema} (${origem}) — recuperando`);
+    if (problema === 'página travada') { try { wc.forcefullyCrashRenderer(); } catch {} }
+    setTimeout(() => abrirServidor(problema), problema === 'página travada' ? 500 : 0);
+  } catch (e) { log('⚠️ verificarTelaBranca:', e.message); }
+}
+
 // ── System Tray ─────────────────────────────────────────────
 function createTray() {
   try {
@@ -425,7 +580,7 @@ function createTray() {
     {
       label: '🔄 Recarregar',
       click: () => {
-        if (mainWindow) mainWindow.reload();
+        if (mainWindow) { mainWindow.show(); abrirServidor('menu da bandeja'); }
       }
     },
     {
@@ -1503,11 +1658,19 @@ function setupIPC() {
   ipcMain.handle('app:loadServerUrl', async () => {
     const url = store.get('serverUrl');
     if (!url || !mainWindow || mainWindow.isDestroyed()) return { ok: false };
+    // O app já está tentando sozinho em segundo plano: não briga com ele
+    // (a tela offline só reinicia o contador).
+    if (_cargaGerenciada) return { ok: false, ocupado: true };
     try {
+      _sessionApplied = false;
       await mainWindow.loadURL(url);
       return { ok: true };
     } catch (err) {
       log('❌ app:loadServerUrl falhou:', err.message);
+      // Antes: a falha deixava a página de erro (em branco) no lugar da tela
+      // offline, e o contador que tenta de novo sumia junto — tela branca
+      // pra sempre. Agora volta pra tela offline, que continua tentando.
+      if (!/ERR_ABORTED/.test(err.message || '')) mostrarOffline('nova tentativa falhou');
       return { ok: false, error: err.message };
     }
   });
@@ -1971,9 +2134,14 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show();
       forceRealFocus(mainWindow);
+      // O usuário clicou no ícone de novo — se a tela estiver branca,
+      // recupera agora (antes só resolvia finalizando a tarefa).
+      setTimeout(() => verificarTelaBranca('ícone clicado de novo'), 1200);
+    } else {
+      createWindow();
     }
   });
 
@@ -2019,6 +2187,33 @@ if (!gotLock) {
         mainWindow.setEnabled(true);
       } catch {}
     }, 3000);
+
+    // ── Vigia de tela branca ─────────────────────────────────────────
+    // A cada 45s, com a janela aberta, confere se o gestor está na tela.
+    setInterval(() => verificarTelaBranca('vigia'), 45000);
+
+    // ── Placa de vídeo (GPU) caiu ────────────────────────────────────
+    // Em PCs com driver de vídeo fraco/antigo o processo de vídeo do
+    // Chromium cai (muito comum ao ligar o PC ou voltar da suspensão) e a
+    // janela fica branca até matar o app. Quando isso acontece, liga o
+    // modo de desenho sem placa de vídeo (mais estável, o gestor não
+    // precisa de GPU) e reinicia o app sozinho, uma única vez.
+    app.on('child-process-gone', (_e, details) => {
+      try {
+        if (!details || details.type !== 'GPU') return;
+        if (details.reason === 'clean-exit') return;
+        log('💥 Processo de vídeo caiu:', details.reason);
+        if (store.get('disableGpu')) return; // já está sem GPU: nada a fazer aqui
+        store.set('disableGpu', true);
+        log('🖥️ Ativando modo sem placa de vídeo e reiniciando');
+        const visivel = !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible());
+        const args = process.argv.slice(1).filter(a => a !== '--hidden');
+        if (!visivel) args.push('--hidden');
+        isQuitting = true;
+        app.relaunch({ args });
+        app.exit(0);
+      } catch (e) { log('⚠️ child-process-gone:', e.message); }
+    });
 
     // Atalho de emergência: corrige o teclado travado na hora, sem precisar
     // fechar e reabrir o app (que reseta um pedido em digitação). Funciona
