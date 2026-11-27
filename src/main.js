@@ -143,11 +143,19 @@ let _forcingFocus = false;
 // isso depois de toda impressão, toda notificação nativa, e disponibilizamos
 // também via atalho manual (Ctrl+Alt+K) e menu da bandeja pra correção
 // instantânea sem precisar fechar e reabrir o app inteiro.
+// v1.10.39+/1.10.40+: depois de impressão e de pedido novo, NÃO minimiza e
+// restaura mais a janela. Isso acontecia a cada pedido e, em PC fraco, a
+// janela sumia e voltava devagar — os cliques nesse meio-tempo se perdiam
+// ("trava e não reage quando clico"). As janelas de impressão já são
+// focusable:false, então não roubam mais o teclado; aqui só devolvemos o
+// foco interno se a janela estiver em uso. O truque forte (minimize+restore)
+// continua no atalho Ctrl+Alt+K e no menu da bandeja, pra quando precisar.
 function restoreKeyboardFocus() {
   try {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (!mainWindow.isVisible() || mainWindow.isMinimized()) return; // não mexe se estiver na bandeja
-    forceRealFocus(mainWindow);
+    if (!mainWindow.isFocused()) return; // usuário está em outro programa: não rouba a tela
+    if (!mainWindow.webContents.isFocused()) mainWindow.webContents.focus();
   } catch {}
 }
 
@@ -339,6 +347,16 @@ function createWindow() {
       mainWindow.hide();
       return false;
     }
+  });
+
+  // Windows desligando/reiniciando/saindo da conta: libera o fechamento.
+  // Sem isso o "minimizar para a bandeja" acima segurava a janela, o Windows
+  // mostrava "EstimaFood está impedindo o encerramento" e, ao forçar,
+  // aparecia o erro 0x80000003 (o Windows matava o programa no meio).
+  mainWindow.on('session-end', () => {
+    isQuitting = true;
+    try { log('⏻ Windows encerrando a sessão — fechando o EstimaFood'); } catch {}
+    try { app.exit(0); } catch {}
   });
 
   mainWindow.on('closed', () => { if (mainWindow === winAtual) mainWindow = null; });
@@ -611,7 +629,26 @@ function getSysPrinters() {
   return mainWindow.webContents.getPrintersAsync();
 }
 
-async function printSilentElectron(html, opts = {}) {
+// ── Fila única de impressão ─────────────────────────────────
+// O gestor (aberto dentro deste app) e a fila do servidor (pedidos do garçom,
+// setores) podem mandar imprimir AO MESMO TEMPO. Dois envios simultâneos para
+// a mesma térmica misturam os dados no meio do caminho e o cupom sai com um
+// bloco de caracteres estranhos (o pedaço de um cupom vira "texto" no outro).
+// Aqui todo envio entra numa fila: um termina, espera um respiro curto para a
+// impressora esvaziar o buffer, e só então o próximo começa.
+let _filaImpressao = Promise.resolve();
+const RESPIRO_ENTRE_IMPRESSOES_MS = 1500;
+function naFilaDeImpressao(tarefa) {
+  const vez = _filaImpressao.then(tarefa);
+  _filaImpressao = vez.catch(() => {}).then(() => new Promise(r => setTimeout(r, RESPIRO_ENTRE_IMPRESSOES_MS)));
+  return vez;
+}
+
+function printSilentElectron(html, opts = {}) {
+  return naFilaDeImpressao(() => _printSilentElectronAgora(html, opts));
+}
+
+async function _printSilentElectronAgora(html, opts = {}) {
   const printer = opts.printer || store.get('printer') || '';
   // Versões antigas do painel mandavam a ÁREA ÚTIL (48 ou 72) no lugar da
   // largura do papel (58 ou 80). Como 48 não é 58, a bobina de 58 mm era
@@ -1230,7 +1267,11 @@ function buildEscPosBytes(order, cfg) {
   return Buffer.from(buf);
 }
 
-async function printRawEscPos(order, cfg) {
+function printRawEscPos(order, cfg) {
+  return naFilaDeImpressao(() => _printRawEscPosAgora(order, cfg));
+}
+
+async function _printRawEscPosAgora(order, cfg) {
   const printerName = cfg.printer || '';
   const data = buildEscPosBytes(order, cfg);
 
@@ -2182,9 +2223,10 @@ if (!gotLock) {
         if (!mainWindow || mainWindow.isDestroyed()) return;
         if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
         if (!mainWindow.isFocused()) return; // só mexe se a janela estiver mesmo em uso
-        mainWindow.webContents.focus();
-        mainWindow.setEnabled(false);
-        mainWindow.setEnabled(true);
+        // Antes: desligava e religava a janela (setEnabled false/true) a cada
+        // 3s. Um clique que caísse nesse instante era perdido e listas abertas
+        // fechavam sozinhas. Agora só devolve o foco interno quando ele saiu.
+        if (!mainWindow.webContents.isFocused()) mainWindow.webContents.focus();
       } catch {}
     }, 3000);
 
@@ -2222,7 +2264,7 @@ if (!gotLock) {
     try {
       globalShortcut.register('Control+Alt+K', () => {
         log('⌨️ Atalho de correção de teclado acionado (Ctrl+Alt+K)');
-        restoreKeyboardFocus();
+        if (mainWindow && !mainWindow.isDestroyed()) forceRealFocus(mainWindow); // truque forte, só sob pedido
       });
     } catch (e) {
       log('⚠️ Não foi possível registrar atalho de teclado:', e.message);
